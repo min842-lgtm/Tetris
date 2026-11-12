@@ -1,0 +1,767 @@
+/*
+ * ============================================================
+ *  Rainbow Tetris  -  raylib + C (Visual Studio)
+ * ============================================================
+ *  조작법
+ *    ← →        : 좌우 이동 (길게 누르면 연속 이동)
+ *    ↑ / X      : 시계 방향 회전
+ *    Z / Ctrl   : 반시계 방향 회전
+ *    ↓          : 소프트 드롭 (+1점/칸)
+ *    Space      : 하드 드롭   (+2점/칸)
+ *    C / Shift  : 홀드
+ *    P          : 일시정지
+ *    T          : 색상 모드 전환 (흐르는 무지개 / 블록별 무지개)
+ *    Enter      : 시작 / 재시작
+ *    ESC        : 종료
+ * ============================================================
+ */
+#include "raylib.h"
+#include <math.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* ---------------- 화면 / 보드 설정 ---------------- */
+#define BOARD_W             10
+#define BOARD_H             20
+#define CELL                32
+#define BOARD_X             40
+#define BOARD_Y             60
+#define PANEL_X             (BOARD_X + BOARD_W * CELL + 40)
+#define PANEL_W             180
+#define SCREEN_W            (PANEL_X + PANEL_W + 30)
+#define SCREEN_H            (BOARD_Y + BOARD_H * CELL + 40)
+
+#define NEXT_COUNT          3
+#define MAX_PARTICLES       800
+
+/* ---------------- 게임 타이밍 ---------------- */
+#define DAS_DELAY           0.17f   /* 좌우 키 누른 후 연속 이동 시작까지 */
+#define DAS_REPEAT          0.05f   /* 연속 이동 간격 */
+#define SOFT_DROP_INTERVAL  0.03f
+#define LOCK_DELAY          0.5f    /* 바닥에 닿은 후 고정까지 시간 */
+#define MAX_LOCK_RESETS     15      /* 바닥에서 움직여 고정 지연을 리셋할 수 있는 횟수 */
+#define CLEAR_TIME          0.35f   /* 줄 삭제 애니메이션 시간 */
+#define POPUP_TIME          1.2f
+
+/* ---------------- 테트로미노 ---------------- */
+enum { PIECE_I, PIECE_J, PIECE_L, PIECE_O, PIECE_S, PIECE_T, PIECE_Z, PIECE_COUNT };
+
+/* 4x4 비트마스크, 각 조각의 4가지 회전 상태 (상위 비트 = 좌상단) */
+static const unsigned short SHAPES[PIECE_COUNT][4] = {
+    { 0x0F00, 0x2222, 0x00F0, 0x4444 }, /* I */
+    { 0x8E00, 0x6440, 0x0E20, 0x44C0 }, /* J */
+    { 0x2E00, 0x4460, 0x0E80, 0xC440 }, /* L */
+    { 0x6600, 0x6600, 0x6600, 0x6600 }, /* O */
+    { 0x6C00, 0x4620, 0x06C0, 0x8C40 }, /* S */
+    { 0x4E00, 0x4640, 0x0E40, 0x4C40 }, /* T */
+    { 0xC600, 0x2640, 0x0C60, 0x4C80 }  /* Z */
+};
+
+typedef struct { int type, rot, x, y; } Piece;
+
+typedef struct {
+    Vector2 pos, vel;
+    float life, maxLife, hue, size;
+} Particle;
+
+typedef enum { STATE_TITLE, STATE_PLAYING, STATE_PAUSED, STATE_GAMEOVER } GameState;
+
+/* ---------------- 전역 상태 ---------------- */
+static int   board[BOARD_H][BOARD_W];   /* 0 = 빈칸, 1~7 = 조각 종류+1 */
+static Piece cur;
+static bool  hasPiece   = false;
+static int   holdType   = -1;
+static bool  holdUsed   = false;
+static int   bag[PIECE_COUNT];
+static int   bagIndex   = PIECE_COUNT;
+static int   nextQueue[NEXT_COUNT];
+
+static int   score = 0, lines = 0, level = 1, highScore = 0;
+static float fallTimer = 0.0f, lockTimer = 0.0f;
+static int   lockResets = 0;
+static int   dasDir = 0;
+static float dasTimer = 0.0f;
+
+static bool  clearingRows[BOARD_H];
+static bool  isClearing = false;
+static float clearTimer = 0.0f;
+
+static Particle particles[MAX_PARTICLES];
+static float gTime = 0.0f;
+static float shakeTimer = 0.0f;
+static const char *popupText = NULL;
+static float popupTimer = 0.0f;
+static int   colorMode = 0;
+static GameState state = STATE_TITLE;
+
+/* ============================================================
+ *  유틸리티 / 색상
+ * ============================================================ */
+static float WrapHue(float h)
+{
+    h = fmodf(h, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    return h;
+}
+
+static Color Rainbow(float hue, float sat, float val)
+{
+    return ColorFromHSV(WrapHue(hue), sat, val);
+}
+
+static float RandF(float a, float b)
+{
+    return a + (b - a) * ((float)GetRandomValue(0, 10000) / 10000.0f);
+}
+
+/* 셀 위치에 따른 무지개 색상(Hue) 계산 */
+static float CellHue(float col, float row, int type)
+{
+    if (colorMode == 0)  /* 보드 전체에 흐르는 대각선 무지개 */
+        return gTime * 90.0f + col * 10.0f + row * 14.0f;
+    /* 조각마다 고유 색 + 약간의 세로 그라데이션 */
+    return type * (360.0f / PIECE_COUNT) + row * 4.0f + gTime * 25.0f;
+}
+
+static bool PieceCell(int type, int rot, int r, int c)
+{
+    return (SHAPES[type][rot] & (0x8000 >> (r * 4 + c))) != 0;
+}
+
+/* ============================================================
+ *  파티클
+ * ============================================================ */
+static void SpawnParticle(float x, float y, float hue)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].life <= 0.0f) {
+            float ang = RandF(0.0f, 2.0f * PI);
+            float spd = RandF(60.0f, 280.0f);
+            particles[i].pos     = (Vector2){ x, y };
+            particles[i].vel     = (Vector2){ cosf(ang) * spd, sinf(ang) * spd - 120.0f };
+            particles[i].maxLife = RandF(0.6f, 1.2f);
+            particles[i].life    = particles[i].maxLife;
+            particles[i].hue     = hue;
+            particles[i].size    = RandF(2.0f, 5.0f);
+            return;
+        }
+    }
+}
+
+static void UpdateParticles(float dt)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle *p = &particles[i];
+        if (p->life <= 0.0f) continue;
+        p->vel.y += 500.0f * dt;
+        p->pos.x += p->vel.x * dt;
+        p->pos.y += p->vel.y * dt;
+        p->hue   += 200.0f * dt;
+        p->life  -= dt;
+    }
+}
+
+static void DrawParticles(void)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle *p = &particles[i];
+        if (p->life <= 0.0f) continue;
+        float t = p->life / p->maxLife;
+        DrawCircleV(p->pos, p->size * (0.5f + 0.5f * t), Fade(Rainbow(p->hue, 0.8f, 1.0f), t));
+    }
+}
+
+/* ============================================================
+ *  게임 로직
+ * ============================================================ */
+static bool Collides(Piece p)
+{
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            if (!PieceCell(p.type, p.rot, r, c)) continue;
+            int x = p.x + c, y = p.y + r;
+            if (x < 0 || x >= BOARD_W || y >= BOARD_H) return true;
+            if (y >= 0 && board[y][x]) return true;
+        }
+    return false;
+}
+
+static bool IsGrounded(void)
+{
+    Piece t = cur;
+    t.y++;
+    return Collides(t);
+}
+
+/* 7-bag 랜덤: 7개 조각을 섞어 순서대로 뽑음 */
+static void RefillBag(void)
+{
+    for (int i = 0; i < PIECE_COUNT; i++) bag[i] = i;
+    for (int i = PIECE_COUNT - 1; i > 0; i--) {
+        int j = GetRandomValue(0, i);
+        int t = bag[i]; bag[i] = bag[j]; bag[j] = t;
+    }
+    bagIndex = 0;
+}
+
+static int DrawFromBag(void)
+{
+    if (bagIndex >= PIECE_COUNT) RefillBag();
+    return bag[bagIndex++];
+}
+
+static void SetGameOver(void)
+{
+    state = STATE_GAMEOVER;
+    hasPiece = false;
+    if (score > highScore) highScore = score;
+}
+
+static void SpawnPiece(int type)
+{
+    cur.type = type;
+    cur.rot  = 0;
+    cur.x    = 3;
+    cur.y    = 0;
+    fallTimer  = 0.0f;
+    lockTimer  = 0.0f;
+    lockResets = 0;
+    hasPiece   = true;
+    if (Collides(cur)) SetGameOver();
+}
+
+static void SpawnNext(void)
+{
+    int t = nextQueue[0];
+    for (int i = 0; i < NEXT_COUNT - 1; i++) nextQueue[i] = nextQueue[i + 1];
+    nextQueue[NEXT_COUNT - 1] = DrawFromBag();
+    SpawnPiece(t);
+}
+
+static bool TryMove(int dx, int dy)
+{
+    Piece t = cur;
+    t.x += dx; t.y += dy;
+    if (Collides(t)) return false;
+    cur = t;
+    return true;
+}
+
+/* 간단한 벽 차기(Wall Kick) 포함 회전 */
+static bool TryRotate(int dir)
+{
+    static const int kicks[][2] = {
+        { 0, 0 }, { -1, 0 }, { 1, 0 }, { 0, -1 },
+        { -2, 0 }, { 2, 0 }, { -1, -1 }, { 1, -1 }
+    };
+    if (cur.type == PIECE_O) return false;
+
+    Piece p = cur;
+    p.rot = (p.rot + dir + 4) % 4;
+    for (int k = 0; k < (int)(sizeof(kicks) / sizeof(kicks[0])); k++) {
+        Piece t = p;
+        t.x += kicks[k][0];
+        t.y += kicks[k][1];
+        if (!Collides(t)) { cur = t; return true; }
+    }
+    return false;
+}
+
+/* 바닥에서 움직이면 고정 타이머 리셋 (횟수 제한) */
+static void OnPieceMoved(void)
+{
+    if (IsGrounded() && lockResets < MAX_LOCK_RESETS) {
+        lockTimer = 0.0f;
+        lockResets++;
+    }
+}
+
+static Piece GetGhost(void)
+{
+    Piece g = cur;
+    while (!Collides(g)) g.y++;
+    g.y--;
+    return g;
+}
+
+static float GravityInterval(void)
+{
+    int lv = (level > 20) ? 20 : level;
+    return powf(0.8f - (lv - 1) * 0.007f, (float)(lv - 1));
+}
+
+static void LockPiece(void)
+{
+    bool overflow = false;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            if (!PieceCell(cur.type, cur.rot, r, c)) continue;
+            int x = cur.x + c, y = cur.y + r;
+            if (y < 0) overflow = true;
+            else board[y][x] = cur.type + 1;
+        }
+    hasPiece = false;
+    holdUsed = false;
+
+    if (overflow) { SetGameOver(); return; }
+
+    /* 완성된 줄 검사 */
+    int count = 0;
+    for (int y = 0; y < BOARD_H; y++) {
+        bool full = true;
+        for (int x = 0; x < BOARD_W; x++)
+            if (!board[y][x]) { full = false; break; }
+        clearingRows[y] = full;
+        if (full) count++;
+    }
+
+    if (count > 0) {
+        static const int points[5] = { 0, 100, 300, 500, 800 };
+        static const char *names[5] = { "", "SINGLE", "DOUBLE", "TRIPLE", "TETRIS!" };
+
+        score += points[count] * level;
+        lines += count;
+        level  = lines / 10 + 1;
+
+        isClearing = true;
+        clearTimer = CLEAR_TIME;
+        popupText  = names[count];
+        popupTimer = POPUP_TIME;
+        if (count == 4) shakeTimer = 0.3f;
+
+        for (int y = 0; y < BOARD_H; y++) {
+            if (!clearingRows[y]) continue;
+            for (int x = 0; x < BOARD_W; x++) {
+                float hue = CellHue((float)x, (float)y, board[y][x] - 1);
+                for (int k = 0; k < 4; k++)
+                    SpawnParticle((float)(BOARD_X + x * CELL + CELL / 2),
+                                  (float)(BOARD_Y + y * CELL + CELL / 2), hue);
+            }
+        }
+    } else {
+        SpawnNext();
+    }
+}
+
+static void RemoveClearedRows(void)
+{
+    int dst = BOARD_H - 1;
+    for (int src = BOARD_H - 1; src >= 0; src--) {
+        if (!clearingRows[src]) {
+            if (dst != src) memcpy(board[dst], board[src], sizeof(board[0]));
+            dst--;
+        }
+    }
+    for (; dst >= 0; dst--) memset(board[dst], 0, sizeof(board[0]));
+    memset(clearingRows, 0, sizeof(clearingRows));
+}
+
+static void HoldPiece(void)
+{
+    if (holdUsed || !hasPiece) return;
+    int t = cur.type;
+    if (holdType < 0) {
+        holdType = t;
+        SpawnNext();
+    } else {
+        int h = holdType;
+        holdType = t;
+        SpawnPiece(h);
+    }
+    holdUsed = true;
+}
+
+static void HardDrop(void)
+{
+    Piece g = GetGhost();
+    score += (g.y - cur.y) * 2;
+    cur = g;
+    LockPiece();
+}
+
+static void ResetGame(void)
+{
+    memset(board, 0, sizeof(board));
+    memset(clearingRows, 0, sizeof(clearingRows));
+    memset(particles, 0, sizeof(particles));
+    score = 0; lines = 0; level = 1;
+    holdType = -1; holdUsed = false;
+    isClearing = false; popupText = NULL; popupTimer = 0.0f;
+    dasDir = 0; shakeTimer = 0.0f;
+    bagIndex = PIECE_COUNT;
+    for (int i = 0; i < NEXT_COUNT; i++) nextQueue[i] = DrawFromBag();
+    SpawnNext();
+}
+
+static void UpdateGame(float dt)
+{
+    /* 줄 삭제 애니메이션 중 */
+    if (isClearing) {
+        clearTimer -= dt;
+        if (clearTimer <= 0.0f) {
+            RemoveClearedRows();
+            isClearing = false;
+            SpawnNext();
+        }
+        return;
+    }
+    if (!hasPiece) return;
+
+    /* 홀드 */
+    if (IsKeyPressed(KEY_C) || IsKeyPressed(KEY_LEFT_SHIFT)) {
+        HoldPiece();
+        if (state != STATE_PLAYING) return;
+    }
+
+    /* 회전 */
+    if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_X)) { if (TryRotate(1))  OnPieceMoved(); }
+    if (IsKeyPressed(KEY_Z) || IsKeyPressed(KEY_LEFT_CONTROL)) { if (TryRotate(-1)) OnPieceMoved(); }
+
+    /* 좌우 이동 (DAS) */
+    if (IsKeyPressed(KEY_LEFT))  { dasDir = -1; dasTimer = DAS_DELAY; if (TryMove(-1, 0)) OnPieceMoved(); }
+    if (IsKeyPressed(KEY_RIGHT)) { dasDir =  1; dasTimer = DAS_DELAY; if (TryMove( 1, 0)) OnPieceMoved(); }
+    if (dasDir == -1 && !IsKeyDown(KEY_LEFT))  { dasDir = IsKeyDown(KEY_RIGHT) ?  1 : 0; dasTimer = DAS_DELAY; }
+    if (dasDir ==  1 && !IsKeyDown(KEY_RIGHT)) { dasDir = IsKeyDown(KEY_LEFT)  ? -1 : 0; dasTimer = DAS_DELAY; }
+    if (dasDir != 0) {
+        dasTimer -= dt;
+        while (dasTimer <= 0.0f) {
+            if (TryMove(dasDir, 0)) OnPieceMoved();
+            else { dasTimer = 0.0f; break; }
+            dasTimer += DAS_REPEAT;
+        }
+    }
+
+    /* 하드 드롭 */
+    if (IsKeyPressed(KEY_SPACE)) { HardDrop(); return; }
+
+    /* 중력 + 소프트 드롭 */
+    bool soft = IsKeyDown(KEY_DOWN);
+    float interval = GravityInterval();
+    if (soft && interval > SOFT_DROP_INTERVAL) interval = SOFT_DROP_INTERVAL;
+
+    fallTimer += dt;
+    while (fallTimer >= interval) {
+        fallTimer -= interval;
+        if (TryMove(0, 1)) { if (soft) score += 1; }
+        else { fallTimer = 0.0f; break; }
+    }
+
+    /* 고정 지연 */
+    if (IsGrounded()) {
+        lockTimer += dt;
+        if (lockTimer >= LOCK_DELAY) LockPiece();
+    } else {
+        lockTimer = 0.0f;
+    }
+}
+
+/* ============================================================
+ *  렌더링
+ * ============================================================ */
+
+/* 무지개 그라데이션 블록 1칸 */
+static void DrawBlock(int px, int py, int size, float hue, float span, float alpha)
+{
+    if (size < 4) return;
+    Color top    = Fade(Rainbow(hue,        0.70f, 1.00f), alpha);
+    Color bottom = Fade(Rainbow(hue + span, 0.90f, 0.78f), alpha);
+    DrawRectangleGradientV(px + 1, py + 1, size - 2, size - 2, top, bottom);
+    if (size > 8)
+        DrawRectangle(px + 3, py + 3, size - 6, size / 8, Fade(WHITE, 0.35f * alpha));
+    DrawRectangleLines(px, py, size, size, Fade(BLACK, 0.55f * alpha));
+}
+
+static int RainbowTextWidth(const char *text, int fontSize)
+{
+    char buf[2] = { 0 };
+    int w = 0;
+    int len = (int)strlen(text);
+    for (int i = 0; i < len; i++) {
+        buf[0] = text[i];
+        w += MeasureText(buf, fontSize) + fontSize / 10;
+    }
+    return w;
+}
+
+/* 글자마다 색이 다른 무지개 텍스트 (wave = 물결 효과) */
+static void DrawRainbowText(const char *text, int x, int y, int fontSize,
+                            float hueOffset, bool wave, float alpha)
+{
+    char buf[2] = { 0 };
+    int cx = x;
+    int len = (int)strlen(text);
+    for (int i = 0; i < len; i++) {
+        buf[0] = text[i];
+        int yo = wave ? (int)(sinf(gTime * 4.0f + i * 0.5f) * 4.0f) : 0;
+        Color c = Fade(Rainbow(gTime * 150.0f + hueOffset + i * 25.0f, 0.8f, 1.0f), alpha);
+        DrawText(buf, cx + 2, y + yo + 2, fontSize, Fade(BLACK, 0.5f * alpha));
+        DrawText(buf, cx, y + yo, fontSize, c);
+        cx += MeasureText(buf, fontSize) + fontSize / 10;
+    }
+}
+
+static void DrawRainbowTextCentered(const char *text, int centerX, int y, int fontSize, float alpha)
+{
+    int w = RainbowTextWidth(text, fontSize);
+    DrawRainbowText(text, centerX - w / 2, y, fontSize, 0.0f, true, alpha);
+}
+
+/* 보드 주위를 흐르는 무지개 테두리 */
+static void DrawRainbowFrame(int x, int y, int w, int h, int t)
+{
+    float perim = 2.0f * (float)(w + h);
+    float base  = -gTime * 160.0f;
+    const int step = 4;
+
+    for (int i = -t; i < w + t; i += step) {
+        float pTop = (float)i;
+        float pBot = (float)(w + h + (w - i));
+        DrawRectangle(x + i, y - t, step, t, Rainbow(base + pTop / perim * 720.0f, 0.85f, 1.0f));
+        DrawRectangle(x + i, y + h, step, t, Rainbow(base + pBot / perim * 720.0f, 0.85f, 1.0f));
+    }
+    for (int j = 0; j < h; j += step) {
+        float pRight = (float)(w + j);
+        float pLeft  = (float)(2 * w + h + (h - j));
+        DrawRectangle(x + w, y + j, t, step, Rainbow(base + pRight / perim * 720.0f, 0.85f, 1.0f));
+        DrawRectangle(x - t, y + j, t, step, Rainbow(base + pLeft  / perim * 720.0f, 0.85f, 1.0f));
+    }
+}
+
+/* NEXT / HOLD 미리보기 조각 (박스 중앙 정렬) */
+static void DrawMiniPiece(int type, int cx, int cy, int cs, float alpha)
+{
+    int minR = 4, maxR = -1, minC = 4, maxC = -1;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            if (PieceCell(type, 0, r, c)) {
+                if (r < minR) minR = r;
+                if (r > maxR) maxR = r;
+                if (c < minC) minC = c;
+                if (c > maxC) maxC = c;
+            }
+    int w = (maxC - minC + 1) * cs;
+    int h = (maxR - minR + 1) * cs;
+    int sx = cx - w / 2, sy = cy - h / 2;
+
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            if (PieceCell(type, 0, r, c))
+                DrawBlock(sx + (c - minC) * cs, sy + (r - minR) * cs, cs,
+                          CellHue((float)c, (float)r, type), 14.0f, alpha);
+}
+
+static void DrawPanelBox(int x, int y, int w, int h, const char *label, float hueOff)
+{
+    DrawRectangle(x, y, w, h, Fade(BLACK, 0.45f));
+    DrawRectangleLinesEx((Rectangle){ (float)x, (float)y, (float)w, (float)h }, 2.0f,
+                         Rainbow(gTime * 100.0f + hueOff, 0.8f, 1.0f));
+    if (label) DrawRainbowText(label, x + 10, y + 8, 20, hueOff, false, 1.0f);
+}
+
+static void DrawBoard(void)
+{
+    int ox = BOARD_X, oy = BOARD_Y;
+    if (shakeTimer > 0.0f) { ox += GetRandomValue(-4, 4); oy += GetRandomValue(-4, 4); }
+    int bw = BOARD_W * CELL, bh = BOARD_H * CELL;
+
+    /* 테두리 + 배경 + 격자 */
+    DrawRainbowFrame(ox, oy, bw, bh, 6);
+    DrawRectangleGradientV(ox, oy, bw, bh, (Color){ 22, 18, 40, 245 }, (Color){ 8, 8, 16, 245 });
+    for (int x = 1; x < BOARD_W; x++) DrawLine(ox + x * CELL, oy, ox + x * CELL, oy + bh, Fade(WHITE, 0.06f));
+    for (int y = 1; y < BOARD_H; y++) DrawLine(ox, oy + y * CELL, ox + bw, oy + y * CELL, Fade(WHITE, 0.06f));
+
+    /* 타이틀 화면: 무지개 물결 배경 */
+    if (state == STATE_TITLE) {
+        for (int y = 0; y < BOARD_H; y++)
+            for (int x = 0; x < BOARD_W; x++) {
+                float a = 0.12f + 0.12f * sinf(gTime * 2.0f + x * 0.7f + y * 0.45f);
+                DrawBlock(ox + x * CELL, oy + y * CELL, CELL, CellHue((float)x, (float)y, (x + y) % PIECE_COUNT), 14.0f, a);
+            }
+    }
+
+    /* 쌓인 블록 */
+    float k = isClearing ? clearTimer / CLEAR_TIME : 0.0f;
+    for (int y = 0; y < BOARD_H; y++)
+        for (int x = 0; x < BOARD_W; x++) {
+            if (!board[y][x]) continue;
+            int px = ox + x * CELL, py = oy + y * CELL;
+            float hue = CellHue((float)x, (float)y, board[y][x] - 1);
+            if (isClearing && clearingRows[y]) {
+                int s = (int)((1.0f - k) * CELL * 0.4f);
+                DrawBlock(px + s, py + s, CELL - 2 * s, hue, 14.0f, 1.0f);
+                DrawRectangle(px, py, CELL, CELL, Fade(WHITE, 0.7f * k));
+            } else {
+                DrawBlock(px, py, CELL, hue, 14.0f, 1.0f);
+            }
+        }
+
+    /* 고스트 + 현재 조각 */
+    if (hasPiece && state != STATE_TITLE) {
+        Piece g = GetGhost();
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                if (!PieceCell(g.type, g.rot, r, c)) continue;
+                int gx = g.x + c, gy = g.y + r;
+                if (gy < 0) continue;
+                Color col = Rainbow(CellHue((float)gx, (float)gy, g.type), 0.8f, 1.0f);
+                DrawRectangle(ox + gx * CELL + 2, oy + gy * CELL + 2, CELL - 4, CELL - 4, Fade(col, 0.12f));
+                DrawRectangleLinesEx((Rectangle){ (float)(ox + gx * CELL + 2), (float)(oy + gy * CELL + 2),
+                                                  (float)(CELL - 4), (float)(CELL - 4) }, 2.0f, Fade(col, 0.6f));
+            }
+
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                if (!PieceCell(cur.type, cur.rot, r, c)) continue;
+                int x = cur.x + c, y = cur.y + r;
+                if (y < 0) continue;
+                DrawBlock(ox + x * CELL, oy + y * CELL, CELL, CellHue((float)x, (float)y, cur.type), 14.0f, 1.0f);
+            }
+    }
+}
+
+static void DrawSidePanel(void)
+{
+    int x = PANEL_X;
+
+    /* 타이틀 */
+    DrawRainbowText("RAINBOW", x, 58, 32, 0.0f, true, 1.0f);
+    DrawRainbowText("TETRIS", x, 96, 40, 120.0f, true, 1.0f);
+
+    /* NEXT */
+    DrawPanelBox(x, 155, PANEL_W, 210, "NEXT", 0.0f);
+    for (int i = 0; i < NEXT_COUNT; i++) {
+        int cs = (i == 0) ? 24 : 18;
+        DrawMiniPiece(nextQueue[i], x + PANEL_W / 2, 155 + 62 + i * 58, cs, (i == 0) ? 1.0f : 0.75f);
+    }
+
+    /* HOLD */
+    DrawPanelBox(x, 380, PANEL_W, 100, "HOLD", 90.0f);
+    if (holdType >= 0)
+        DrawMiniPiece(holdType, x + PANEL_W / 2, 380 + 62, 20, holdUsed ? 0.35f : 1.0f);
+
+    /* 점수 */
+    DrawPanelBox(x, 495, PANEL_W, 122, NULL, 180.0f);
+    const char *labels[4] = { "SCORE", "LEVEL", "LINES", "BEST" };
+    int values[4] = { score, level, lines, (score > highScore) ? score : highScore };
+    for (int i = 0; i < 4; i++) {
+        int ly = 505 + i * 27;
+        DrawText(labels[i], x + 12, ly, 20, Fade(WHITE, 0.75f));
+        const char *v = TextFormat("%d", values[i]);
+        DrawText(v, x + PANEL_W - 12 - MeasureText(v, 20), ly, 20, Rainbow(gTime * 120.0f + i * 60.0f, 0.6f, 1.0f));
+    }
+
+    /* 조작법 */
+    const char *help[6] = {
+        "Left/Right : Move",
+        "Up / X     : Rotate CW",
+        "Z / Ctrl   : Rotate CCW",
+        "Down/Space : Soft/Hard",
+        "C : Hold    P : Pause",
+        "T : Color mode"
+    };
+    for (int i = 0; i < 6; i++)
+        DrawText(help[i], x + 4, 630 + i * 15, 12, Fade(WHITE, 0.6f));
+}
+
+static void DrawOverlays(void)
+{
+    int bw = BOARD_W * CELL, bh = BOARD_H * CELL;
+    int cx = BOARD_X + bw / 2;
+
+    /* 줄 삭제 팝업 */
+    if (popupText && popupTimer > 0.0f && state == STATE_PLAYING) {
+        float a = popupTimer / POPUP_TIME;
+        int fs = (popupText[0] == 'T') ? 44 : 32;
+        int y = BOARD_Y + bh / 2 - 60 - (int)((POPUP_TIME - popupTimer) * 40.0f);
+        DrawRainbowTextCentered(popupText, cx, y, fs, a);
+    }
+
+    if (state == STATE_TITLE) {
+        DrawRectangle(BOARD_X, BOARD_Y, bw, bh, Fade(BLACK, 0.45f));
+        DrawRainbowTextCentered("RAINBOW", cx, BOARD_Y + 200, 48, 1.0f);
+        DrawRainbowTextCentered("TETRIS", cx, BOARD_Y + 255, 56, 1.0f);
+        if (fmodf(gTime, 1.0f) < 0.65f) {
+            const char *msg = "Press ENTER to start";
+            DrawText(msg, cx - MeasureText(msg, 20) / 2, BOARD_Y + 360, 20, RAYWHITE);
+        }
+    } else if (state == STATE_PAUSED) {
+        DrawRectangle(BOARD_X, BOARD_Y, bw, bh, Fade(BLACK, 0.6f));
+        DrawRainbowTextCentered("PAUSED", cx, BOARD_Y + bh / 2 - 30, 48, 1.0f);
+        const char *msg = "Press P to resume";
+        DrawText(msg, cx - MeasureText(msg, 20) / 2, BOARD_Y + bh / 2 + 35, 20, RAYWHITE);
+    } else if (state == STATE_GAMEOVER) {
+        DrawRectangle(BOARD_X, BOARD_Y, bw, bh, Fade(BLACK, 0.65f));
+        DrawRainbowTextCentered("GAME OVER", cx, BOARD_Y + bh / 2 - 80, 44, 1.0f);
+        const char *s = TextFormat("SCORE  %d", score);
+        DrawText(s, cx - MeasureText(s, 24) / 2, BOARD_Y + bh / 2 - 10, 24, RAYWHITE);
+        if (score >= highScore && score > 0) {
+            DrawRainbowTextCentered("NEW RECORD!", cx, BOARD_Y + bh / 2 + 25, 24, 1.0f);
+        }
+        if (fmodf(gTime, 1.0f) < 0.65f) {
+            const char *msg = "Press ENTER to restart";
+            DrawText(msg, cx - MeasureText(msg, 20) / 2, BOARD_Y + bh / 2 + 75, 20, RAYWHITE);
+        }
+    }
+}
+
+static void DrawGame(void)
+{
+    /* 천천히 색이 변하는 배경 그라데이션 */
+    float h = gTime * 20.0f;
+    DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H,
+                           Rainbow(h, 0.55f, 0.22f), Rainbow(h + 140.0f, 0.55f, 0.08f));
+
+    DrawBoard();
+    DrawParticles();
+    DrawSidePanel();
+    DrawOverlays();
+}
+
+/* ============================================================
+ *  main
+ * ============================================================ */
+int main(void)
+{
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
+    InitWindow(SCREEN_W, SCREEN_H, "Rainbow Tetris - raylib");
+    SetTargetFPS(60);
+
+    ResetGame();
+    state = STATE_TITLE;
+
+    while (!WindowShouldClose()) {
+        float dt = GetFrameTime();
+        if (dt > 0.1f) dt = 0.1f;   /* 창 드래그 등으로 인한 시간 튐 방지 */
+
+        gTime += dt;
+        if (shakeTimer > 0.0f) shakeTimer -= dt;
+        if (popupTimer > 0.0f) popupTimer -= dt;
+        UpdateParticles(dt);
+
+        if (IsKeyPressed(KEY_T)) colorMode ^= 1;
+
+        switch (state) {
+        case STATE_TITLE:
+            if (IsKeyPressed(KEY_ENTER)) { ResetGame(); state = STATE_PLAYING; }
+            break;
+        case STATE_PLAYING:
+            if (IsKeyPressed(KEY_P)) state = STATE_PAUSED;
+            else UpdateGame(dt);
+            break;
+        case STATE_PAUSED:
+            if (IsKeyPressed(KEY_P)) state = STATE_PLAYING;
+            break;
+        case STATE_GAMEOVER:
+            if (IsKeyPressed(KEY_ENTER)) { ResetGame(); state = STATE_PLAYING; }
+            break;
+        }
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        DrawGame();
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
